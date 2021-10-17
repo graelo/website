@@ -3,7 +3,7 @@ title: "Shared state"
 ---
 
 So far, we have a key-value server working. However, there is a major flaw:
-state is not shared across connections. We will fix that in this article.
+state is not shared across connections. We will fix that in this chapter.
 
 # Strategies
 
@@ -12,25 +12,32 @@ There are a couple of different ways to share state in Tokio.
 1. Guard the shared state with a Mutex.
 2. Spawn a task to manage the state and use message passing to operate on it.
 
-Generally you want to use the first approach for simple data, and the second
-approach for things that require asynchronous work such as I/O primitives.  In
-this chapter, the shared state is a `HashMap` and the operations are `insert`
-and `get`. Neither of these operations is asynchronous, so we will use a
-`Mutex`.
+When the state is simple data, the first strategy is generally the most
+appropriate. When the shared state involves I/O primitives, then the second
+strategy is the better suited.
 
-The latter approach is covered in the next chapter.
+In this chapter we use first strategy because the shared state is a `HashMap`,
+and the associated operations on that state (`insert` and `get`) are
+synchronous. A `Mutex` is sufficient here.
+
+The next chapter uses the second strategy.
 
 # Add `bytes` dependency
 
-Instead of using `Vec<u8>`, the Mini-Redis crate uses `Bytes` from the [`bytes`]
-crate. The goal of `Bytes` is to provide a robust byte array structure for
+From now on, we will often use `Bytes` (from [`bytes`] crate) instead of using
+`Vec<u8>`.
+
+The first reason for doing this is `bytes` is idiomatic in asynchronous code
+because it provides a robust byte array structure for
 network programming. The biggest feature it adds over `Vec<u8>` is shallow
 cloning. In other words, calling `clone()` on a `Bytes` instance does not copy
 the underlying data. Instead, a `Bytes` instance is a reference-counted handle
 to some underlying data. The `Bytes` type is roughly an `Arc<Vec<u8>>` but with
 some added capabilities.
 
-To depend on `bytes`, add the following to your `Cargo.toml` in the
+The second reason is the Mini-Redis crate uses `Bytes` as part of its API.
+
+To add the dependency on `bytes`, add the following to your `Cargo.toml` in the
 `[dependencies]` section:
 
 ```toml
@@ -41,10 +48,13 @@ bytes = "1"
 
 # Initialize the `HashMap`
 
-The `HashMap` will be shared across many tasks and potentially many threads. To
-support this, it is wrapped in `Arc<Mutex<_>>`.
+Because the server will only have one `HashMap` and share it across many tasks
+and potentially many threads, the code wraps the `HashMap` in a `Arc<Mutex<_>>`
+synchronization mechanism. Using `Arc` allows the `HashMap` to be referenced
+concurrently from many tasks, potentially running on many threads.
 
-First, for convenience, add the following type alias after the `use` statements.
+
+Let's first add a conveniience type alias and its supporting `use` statements:
 
 ```rust
 use bytes::Bytes;
@@ -54,11 +64,16 @@ use std::sync::{Arc, Mutex};
 type Db = Arc<Mutex<HashMap<String, Bytes>>>;
 ```
 
-Then, update the `main` function to initialize the `HashMap` and pass an `Arc`
-**handle** to the `process` function. Using `Arc` allows the `HashMap` to be
-referenced concurrently from many tasks, potentially running on many threads.
-Throughout Tokio, the term **handle** is used to reference a value that provides
-access to some shared state.
+Because there will be only `HashMap` in the program, the `main` function
+initializes it once, and wraps it in a `Mutex` and an `Arc`. This
+initialization call returns a _handle_ which is then passed to the `process`
+function.
+
+[[info]]
+| Throughout Tokio, the term **handle** is used to reference a value that
+| provides access to some shared state.
+
+The resulting code is:
 
 ```rust
 use tokio::net::TcpListener;
@@ -92,28 +107,41 @@ async fn main() {
 
 ## On using `std::sync::Mutex`
 
-Note, `std::sync::Mutex` and **not** `tokio::sync::Mutex` is used to guard the
-`HashMap`. A common error is to unconditionally use `tokio::sync::Mutex` from
-within async code. An async mutex is a mutex that is locked across calls to
-`.await`.
+Note that the `HashMap` is guarded with `std::sync::Mutex` and **not**
+`tokio::sync::Mutex`.  It is a common antipattern to unconditionally use
+`tokio::sync::Mutex` from within async code. Let's explain the difference
+because making the wrong choice impacts performance.
 
-A synchronous mutex will block the current thread when waiting to acquire the
-lock. This, in turn, will block other tasks from processing. However, switching
-to `tokio::sync::Mutex` usually does not help as the asynchronous mutex uses a
-synchronous mutex internally.
-
-As a rule of thumb, using a synchronous mutex from within asynchronous code is
-fine as long as contention remains low and the lock is not held across calls to
-`.await`. Additionally, consider using [`parking_lot::Mutex`][parking_lot] as a
-faster alternative to `std::sync::Mutex`.
+A synchronous mutex, such as `std::sync::Mutex` or its faster alternative
+[`parking_lot::Mutex`], will block the current thread when waiting to acquire
+the lock. Of course, while the thread is blocked waiting to acquire the lock,
+it cannot process other tasks. However, when protecting simple data, this is
+often the best guard strategy and you should use it in asynchronous functions
+as long as the contention remains low and the lock is not held across calls to
+`.await` (a synchronous mutex is not `Send`; we cover this detail later in this
+chapter).
 
 [parking_lot]: https://docs.rs/parking_lot/0.10.2/parking_lot/type.Mutex.html
 
+An asynchronous mutex such as `tokio::sync::Mutex`, is a mutex for which the
+lock can be held across calls to `.await` (it is `Send`) and which does not
+block when waiting to acquire the lock. However this mutex is not magic: it
+uses a synchronous mutex internally, and if used to guard access to simple
+data, it is slower than a `std::sync::Mutex` or `parking_lot::Mutex`.
+
+The primary use case of the async mutex is to provide shared mutable access to
+I/O resources such as a database connection, and even in these cases, spawning
+a task to manage the I/O resource is often a better strategy (see next
+chapter).
+
 # Update `process()`
 
-The process function no longer initializes a `HashMap`. Instead, it takes the
-shared handle to the `HashMap` as an argument. It also needs to lock the
-`HashMap` before using it.
+In our previous code, the `HashMap` initialization code moved from the
+`process` function to the `main` function.  The `process` function now takes
+instead the shared handle to the `HashMap` as an argument. It also needs to
+lock the `HashMap` before using it.
+
+Here is the resulting code:
 
 ```rust
 use tokio::net::TcpStream;
@@ -135,7 +163,7 @@ async fn process(socket: TcpStream, db: Db) {
                 let mut db = db.lock().unwrap();
                 db.insert(cmd.key().to_string(), cmd.value().clone());
                 Frame::Simple("OK".to_string())
-            }           
+            }
             Get(cmd) => {
                 let db = db.lock().unwrap();
                 if let Some(value) = db.get(cmd.key()) {
@@ -155,11 +183,14 @@ async fn process(socket: TcpStream, db: Db) {
 
 # Tasks, threads, and contention
 
-Using a blocking mutex to guard short critical sections is an acceptable
-strategy when contention is minimal. When a lock is contended, the thread
-executing the task must block and wait on the mutex. This will not only block
-the current task but it will also block all other tasks scheduled on the current
-thread.
+We saw earlier that using a synchronous mutex to guard short critical sections
+is an acceptable strategy when contention is minimal. When contention increases
+however, the thread executing the current task must block and wait on the mutex
+to acquire the lock. This not only blocks the _current task_ but it also blocks
+_all other tasks_ scheduled on the current thread.
+
+The contention level is a function of your code design, the runtime you choose
+for your program, and of course the workload.
 
 By default, the Tokio runtime uses a multi-threaded scheduler. Tasks are
 scheduled on any number of threads managed by the runtime. If a large number of
@@ -180,13 +211,16 @@ never be contended.
 If contention on a synchronous mutex becomes a problem, the best fix is rarely
 to switch to the Tokio mutex. Instead, options to consider are:
 
-- Switching to a dedicated task to manage state and use message passing.
-- Shard the mutex.
+- Switch to a dedicated task to manage state and use message passing (next
+  chapter).
+- Reduce contention by sharding the shared state and the mutex.
 - Restructure the code to avoid the mutex.
 
-In our case, as each *key* is independent, mutex sharding will work well. To do
-this, instead of having a single `Mutex<HashMap<_, _>>` instance, we would
-introduce `N` distinct instances.
+## Sharding storage and associated mutex
+
+In our case, as each *key* of the `HashMap` is independent, storage and mutex
+sharding will work well. To apply this strategy, replace the single
+`Mutex<HashMap<_, _>>` instance with `N` distinct instances:
 
 ```rust
 # use std::collections::HashMap;
@@ -194,9 +228,9 @@ introduce `N` distinct instances.
 type ShardedDb = Arc<Vec<Mutex<HashMap<String, Vec<u8>>>>>;
 ```
 
-Then, finding the cell for any given key becomes a two step process. First, the
-key is used to identify which shard it is part of. Then, the key is looked up in
-the `HashMap`.
+With the `ShardedDb`, finding the cell for any given key becomes a two step
+process. First, the key is used to identify which shard it is part of. Then,
+the key is looked up in the `HashMap` of the corresponding shard.
 
 ```rust,compile_fail
 let shard = db[hash(key) % db.len()].lock().unwrap();
@@ -208,9 +242,15 @@ The [dashmap] crate provides an implementation of a sharded hash map.
 [current_thread]: https://docs.rs/tokio/1/tokio/runtime/index.html#current-thread-scheduler
 [dashmap]: https://docs.rs/dashmap
 
-# Holding a `MutexGuard` across an `.await`
+## Restructure your code to not hold the lock across an `.await`
 
-You might write code that looks like this:
+Before restructuring the code, let go back to our discussion on holding a
+synchronous mutex lock across `.await`calls.
+
+### What happens when a `MutexGuard` is held across an `.await`
+
+You might find yourself writing erroneous code that looks like this:
+
 ```rust
 use std::sync::{Mutex, MutexGuard};
 
@@ -222,8 +262,10 @@ async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
 } // lock goes out of scope here
 # async fn do_something_async() {}
 ```
-When you try to spawn something that calls this function, you will encounter the
+
+When you try to spawn a task that calls this function, you encounter the
 following error message:
+
 ```text
 error: future cannot be sent between threads safely
    --> src/lib.rs:13:5
@@ -248,11 +290,24 @@ note: future is not `Send` as this value is used across an await
 8   | }
     | - `mut lock` is later dropped here
 ```
-This happens because the `std::sync::MutexGuard` type is **not** `Send`. This
-means that you can't send a mutex lock to another thread, and the error happens
-because the Tokio runtime can move a task between threads at every `.await`.
-To avoid this, you should restructure your code such that the mutex lock's
-destructor runs before the `.await`.
+
+This happens because the lock is still in scope when `.await` is called.
+Because you can't send a mutex lock to another thread (due to
+`std::sync::MutexGuard` **not** being `Send`), so the task cannot save what is in
+scope into its state, hence the compilation error.
+
+We already saw in the [Send bound section from the spawning
+chapter][send-bound] that this `Send` requirement is necessary because the
+Tokio runtime can move a task between threads at any `.await` call.
+
+[send-bound]: spawning#send-bound
+
+### Technique 1 - scope the mutex
+
+If you find yourself in the above situation, you should restructure your code
+such that the mutex lock exits the scope before the `.await` call. For
+instance, the following code is correct and will compile.
+
 ```rust
 # use std::sync::{Mutex, MutexGuard};
 // This works!
@@ -266,7 +321,11 @@ async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
 }
 # async fn do_something_async() {}
 ```
-Note that this does not work:
+
+However, you might think it suffices to drop the lock before the call to
+`.await`. You will be disappointed because it still insufficient for the
+compiler. For instance, the following code does not compile:
+
 ```rust
 use std::sync::{Mutex, MutexGuard};
 
@@ -280,30 +339,29 @@ async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
 }
 # async fn do_something_async() {}
 ```
-This is because the compiler currently calculates whether a future is `Send`
-based on scope information only. The compiler will hopefully be updated to
-support explicitly dropping it in the future, but for now, you must explicitly
-use a scope.
 
-Note that the error discussed here is also discussed in the [Send bound section
-from the spawning chapter][send-bound].
+The reason is the compiler currently calculates whether a future is `Send`
+based on scope information only. It will hopefully be updated to support
+explicitly dropping it in the future, but for now, you must explicitly use a
+scope.
 
-You should not try to circumvent this issue by spawning the task in a way that
-does not require it to be `Send`, because if Tokio suspends your task at an
-`.await` while the task is holding the lock, some other task may be scheduled to
-run on the same thread, and this other task may also try to lock that mutex,
-which would result in a deadlock as the task waiting to lock the mutex would
-prevent the task holding the mutex from releasing the mutex.
+In any case, you should not try to circumvent this issue by spawning the task
+in a way that does not require it to be `Send`. You would be trying to get away
+with a blocking lock in the wild. This is risky because if your task acquires
+the lock and Tokio suspends it in this state at an `.await` call, then some
+other task which may be scheduled to run on the same thread may also try to
+lock that mutex and be blocked too.  This results in a deadlock due to the task
+waiting to lock the mutex preventing the task holding the lock from resuming
+and releasing it.
 
-We will discuss some approaches to fix the error message below:
+### Technique 2 - Wrap the mutex inside sync methods of a struct
 
-[send-bound]: spawning#send-bound
+Another robust way to restructure your code is to wrap the mutex in a struct,
+and only ever lock the mutex inside non-async methods on that struct. This
+guarantees the mutex is not in scope on any `.await` call.
 
-## Restructure your code to not hold the lock across an `.await`
+The following code illustrates this strategy:
 
-We have already seen one example of this in the snippet above, but there are
-some more robust ways to do this. For example, you can wrap the mutex in a
-struct, and only ever lock the mutex inside non-async methods on that struct.
 ```rust
 use std::sync::Mutex;
 
@@ -324,21 +382,14 @@ async fn increment_and_do_stuff(can_incr: &CanIncrement) {
 }
 # async fn do_something_async() {}
 ```
-This pattern guarantees that you won't run into the `Send` error, because the
-mutex guard does not appear anywhere in an async function.
-
-## Spawn a task to manage the state and use message passing to operate on it
-
-This is the second approach mentioned in the start of this chapter, and is often
-used when the shared resource is an I/O resource. See the next chapter for more
-details.
 
 ## Use Tokio's asynchronous mutex
 
 The [`tokio::sync::Mutex`] type provided by Tokio can also be used. The primary
 feature of the Tokio mutex is that it can be held across an `.await` without any
 issues. That said, an asynchronous mutex is more expensive than an ordinary
-mutex, and it is typically better to use one of the two other approaches.
+mutex, and it is typically better to use one of the two other strategies.
+
 ```rust
 use tokio::sync::Mutex; // note! This uses the Tokio mutex
 

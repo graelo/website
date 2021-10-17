@@ -39,7 +39,7 @@ context where appropriate.
 
 # A synchronous interface to mini-redis
 
-In this section, we will go through how to build a synchronous interface to
+In this chapter, we will go through how to build a synchronous interface to
 mini-redis by storing a `Runtime` object and using its `block_on` method.
 In the following sections, we will discuss some alternate approaches and when
 you should use each approach.

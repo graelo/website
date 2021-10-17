@@ -30,19 +30,17 @@ where it makes sense.
 
 # Advantages of Tokio
 
-This section will outline some advantages of Tokio.
-
 ## Fast
 
-Tokio is _fast_, built on top of the Rust programming language, which itself is
-fast. This is done in the spirit of Rust with the goal that you should not be
-able to improve the performance by writing equivalent code by hand.
+Tokio is _fast_ for two reasons. First, it is built on top of the Rust
+programming language, which itself is fast. Second, it shares the same goal as
+Rust: no hand-written code should outperform it.
 
 Tokio is _scalable_, built on top of the async/await language feature, which
-itself is scalable. When dealing with networking, there's a limit to how fast
-you can handle a connection due to latency, so the only way to scale is to
-handle many connections at once. With the async/await language feature,
-increasing the number of concurrent operations becomes incredibly cheap,
+itself is scalable. For instance, when dealing with networking, because latency
+limits how fast you can handle a connection, the only way to scale is to handle
+many connections at once. Thanks to the async/await language feature,
+increasing the number of concurrent operations remains incredibly cheap,
 allowing you to scale to a large number of concurrent tasks.
 
 ## Reliable
@@ -67,24 +65,24 @@ With the Rust's async/await feature, the complexity of writing asynchronous
 applications has been lowered substantially. Paired with Tokio's utilities and
 vibrant ecosystem, writing applications is a breeze.
 
-Tokio follows the standard library's naming convention when it makes sense. This
-allows easily converting code written with only the standard library to code
-written with Tokio. With the strong type system of Rust, the ability to deliver
-correct code easily is unparalleled.
+Tokio follows the standard library's naming convention when it makes sense.
+This allows easily converting code written with only the standard library to
+code written with Tokio. Together with the strong type system of Rust, the
+ability to deliver correct code easily is unparalleled.
 
 ## Flexible
 
-Tokio provides multiple variations of the runtime. Everything from a
+Tokio provides multiple variations of its runtime: everything from a
 multi-threaded, [work-stealing] runtime to a light-weight, single-threaded
-runtime. Each of these runtimes come with many knobs to allow users to tune them
-to their needs.
+runtime. Each of these runtimes comes with many knobs to allow users to tune
+them to their needs.
 
 [work-stealing]: https://en.wikipedia.org/wiki/Work_stealing
 
 # When not to use Tokio
 
 Although Tokio is useful for many projects that need to do a lot of things
-simultaneously, there are also some use-cases where Tokio is not a good fit.
+simultaneously, there are also some use-cases where Tokio is not a good fit:
 
  - Speeding up CPU-bound computations by running them in parallel on several
    threads. Tokio is designed for IO-bound applications where each individual
@@ -96,14 +94,15 @@ simultaneously, there are also some use-cases where Tokio is not a good fit.
    projects that simply need to read a lot of files, Tokio provides no advantage
    here compared to an ordinary threadpool. This is because operating systems
    generally do not provide asynchronous file APIs.
- - Sending a single web request. The place where Tokio gives you an advantage is
-   when you need to do many things at the same time. If you need to use a
-   library intended for asynchronous Rust such as [reqwest], but you don't need
-   to do a lot of things at once, you should prefer the blocking version of that
-   library, as it will make your project simpler. Using Tokio will still work,
-   of course, but provides no real advantage over the blocking API. If the
-   library doesn't provide a blocking API, see [the chapter on
-   bridging with sync code][bridging].
+ - Sending a single web request. While Tokio definitely gives you an advantage
+   when you need to do many things at the same time, if you simply need to send
+   a single web request, you should prefer instead libraries which provide a
+   blocking API as it will make your project simpler. Using Tokio still works
+   fine, but provides no real advantage over a blocking API. In any case, your
+   options are open: some libraries such as the [reqwest] library, although
+   primarily intended for asynchronous Rust, do provide both API versions. And
+   async-only libraries can be used from a synchronous context, as explained in
+   [the chapter on bridging with sync code][bridging].
 
 [rayon]: https://docs.rs/rayon/
 [reqwest]: https://docs.rs/reqwest/

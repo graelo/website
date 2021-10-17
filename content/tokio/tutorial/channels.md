@@ -2,29 +2,32 @@
 title: "Channels"
 ---
 
-Now that we have learned a bit about concurrency with Tokio, let's apply this on
-the client side. Put the server code we wrote before into an explicit binary 
-file:
+Let's deepen the concurrency concepts we learned by applying them to the client
+side.
+
+Move the server code we wrote before into an explicit binary file:
 
 ```text
 mkdir src/bin
 mv src/main.rs src/bin/server.rs
 ```
 
-and create a new binary file that will contain the client code:
+In this chapter, we will ignore the basic `hello-redis.rs` we were using, and
+write new client code in the following source file:
 
 ```text
 touch src/bin/client.rs
 ```
 
-In this file you will write this page's code. Whenever you want to run it,
-you will have to launch the server first in a separate terminal window:
+This client code will connect our server (`src/bin/server.rs`), so whenever you
+want to run the client, you will have to launch the server first in a separate
+terminal window:
 
 ```text
 cargo run --bin server
 ```
 
-And then the client, __separately__:
+and then the client program in its own terminal too:
 
 ```text
 cargo run --bin client
@@ -32,10 +35,11 @@ cargo run --bin client
 
 That being said, let's code!
 
-Say we want to run two concurrent Redis commands. We can spawn
-one task per command. Then the two commands would happen concurrently.
+Say the client needs to send two concurrent Redis commands. Spawning one task
+per command would make the two commands happen concurrently.
 
-At first, we might try something like:
+Naively, we could initialize the client and use it as a reference from each
+spawned task:
 
 ```rust,compile_fail
 use mini_redis::client;
@@ -59,35 +63,57 @@ async fn main() {
 }
 ```
 
-This does not compile because both tasks need to access the `client` somehow.
-As `Client` does not implement `Copy`, it will not compile without some code to
-facilitate this sharing. Additionally, `Client::set` takes `&mut self`, which
-means that exclusive access is required to call it. We could open a connection
-per task, but that is not ideal. We cannot use `std::sync::Mutex` as `.await`
-would need to be called with the lock held. We could use `tokio::sync::Mutex`,
-but that would only allow a single in-flight request. If the client implements
-[pipelining], an async mutex results in underutilizing the connection.
+Both tasks now share the same `client`. However, this does not compile for two
+reasons.
+
+First, because `client` neither implements `Copy` nor has a builtin
+synchronization mechanism.
+
+Second, because both tasks use `Client::set` which needs `&mut self` in order
+to operate. The Rust borrow checker of course rejects any code using multiple
+mutable (exclusive) references to the same value.
+
+Let's review various unsatisfying solutions to this often-encountered situation.
+
+- A cheap / inelegant solution would open one connection per task.
+- We cannot wrap the client in a `std::sync::Mutex` because while waiting for
+  the response, `.await` would need to be called with the lock held.
+- We could wrap the client in a  `tokio::sync::Mutex`, but while waiting for
+  the response in one task, the lock on `client` would be held, and no other
+  task could use it, resulting in a single in-flight request. Generally
+  speaking, if the client implements [pipelining], an async mutex results in
+  underutilizing the connection.
 
 [pipelining]: https://redis.io/topics/pipelining
 
 # Message passing
 
-The answer is to use message passing. The pattern involves spawning a dedicated
-task to manage the `client` resource. Any task that wishes to issue a request
-sends a message to the `client` task. The `client` task issues the request on
-behalf of the sender, and the response is sent back to the sender.
+In the situation we described above, the best answer is to spawn a dedicated
+task to manage the `client` resource, and have tasks that need the resource use
+message passing with it.
 
-Using this strategy, a single connection is established. The task managing the
-`client` is able to get exclusive access in order to call `get` and `set`.
-Additionally, the channel works as a buffer. Operations may be sent to the
-`client` task while the `client` task is busy. Once the `client` task is
-available to process new requests, it pulls the next request from the channel.
-This can result in better throughput, and be extended to support connection
-pooling.
+In practice, the sender task passes a message to the `client` task, the
+`client` then issues the request to the server on behalf of the sender task,
+and finally the server response is sent back from the `client` to the sender
+task.
+
+Let's review the benefits of this strategy:
+
+- A single connection is established.
+- The managing task maintains exclusive access to the `client` in order to call
+  its `get` and `set` methods.
+- The channel used for message passing works as a buffer: work may be passed by
+  sender tasks to the `client` task while the `client` is busy; the `client`
+  task will pull the next request from the channel as soon as it finishes being
+  busy with the current request.
+
+Overall, this may result in better throughput, and can be extended further to
+support connection pooling.
 
 # Tokio's channel primitives
 
-Tokio provides a [number of channels][channels], each serving a different purpose.
+Tokio provides a [number of channels][channels], each serving a different
+purpose.
 
 - [mpsc]: multi-producer, single-consumer channel. Many values can be sent.
 - [oneshot]: single-producer, single consumer channel. A single value can be sent.
@@ -96,15 +122,18 @@ Tokio provides a [number of channels][channels], each serving a different purpos
 - [watch]: single-producer, multi-consumer. Many values can be sent, but no
   history is kept. Receivers only see the most recent value.
 
-If you need a multi-producer multi-consumer channel where only one consumer sees
-each message, you can use the [`async-channel`] crate. There are also channels
-for use outside of asynchronous Rust, such as [`std::sync::mpsc`] and
-[`crossbeam::channel`]. These channels wait for messages by blocking the
-thread, which is not allowed in asynchronous code.
+In addition to the Tokio-provided channels, the [`async-channel`] crate
+provides a multi-producer multi-consumer channel where only one consumer sees
+each message.
 
-In this section, we will use [mpsc] and [oneshot]. The other types of message
-passing channels are explored in later sections. The full code from this section
-is found [here][full].
+It is worth mentioning channels _for use outside of asynchronous Rust_, such as
+[`std::sync::mpsc`] and [`crossbeam::channel`]. These channels wait for
+messages by blocking the thread, which is not allowed in asynchronous code.
+
+In this chapter, we will use [mpsc] and [oneshot], and later chapters will use
+the other types of message passing channels.
+
+The full code from this chapter is found [here][full].
 
 [channels]: https://docs.rs/tokio/1/tokio/sync/index.html
 [mpsc]: https://docs.rs/tokio/1/tokio/sync/mpsc/index.html
@@ -117,10 +146,12 @@ is found [here][full].
 
 # Define the message type
 
-In most cases, when using message passing, the task receiving the messages
-responds to more than one command. In our case, the task will respond to `GET` and
-`SET` commands. To model this, we first define a `Command` enum and include a
-variant for each command type.
+Message passing is flexible; it allows each message passed to the resource task
+to correspond to a different command. In our case, the `client` resource task
+will receive and respond to `GET` and `SET` commands.
+
+To model this, we first define a `Command` enum and include a variant
+for each command type.
 
 ```rust
 use bytes::Bytes;
@@ -139,7 +170,10 @@ enum Command {
 
 # Create the channel
 
-In the `main` function, an `mpsc` channel is created.
+The `main` function creates a `tokio::sync::mpsc` channel for the senders to
+_send_ commands to the `client` resource task (which still manages the
+connection to Redis). The multi-producer capability allows messages to be sent
+from many tasks.
 
 ```rust
 use tokio::sync::mpsc;
@@ -154,17 +188,16 @@ async fn main() {
 }
 ```
 
-The `mpsc` channel is used to **send** commands to the task managing the redis
-connection. The multi-producer capability allows messages to be sent from many
-tasks. Creating the channel returns two values, a sender and a receiver. The two
-handles are used separately. They may be moved to different tasks.
+Creating the channel returns two values, a sender and a receiver. The two
+handles are used separately, and may each be moved to different tasks.
 
 The channel is created with a capacity of 32. If messages are sent faster than
 they are received, the channel will store them. Once the 32 messages are stored
-in the channel, calling `send(...).await` will go to sleep until a message has
-been removed by the receiver.
+in the channel, any `send(...).await` call will go to sleep until a message has
+been removed from the channel by the receiver.
 
-Sending from multiple tasks is done by **cloning** the `Sender`. For example:
+Sending from multiple tasks is done by **cloning** the `Sender` handle. Here is
+a simple example in which each message is a `String`:
 
 ```rust
 use tokio::sync::mpsc;
@@ -188,13 +221,17 @@ async fn main() {
 }
 ```
 
-Both messages are sent to the single `Receiver` handle. It is not possible to
-clone the receiver of an `mpsc` channel.
+Let's describe the mechanics.
 
-When every `Sender` has gone out of scope or has otherwise been dropped, it is
-no longer possible to send more messages into the channel. At this point, the
-`recv` call on the `Receiver` will return `None`, which means that all senders
-are gone and the channel is closed.
+Both messages are sent to the `Receiver` handle. Because mpsc channel can only
+have a single receiver, it is not possible to clone the `Receiver` handle of an
+`mpsc` channel.
+
+After all `Sender` handles have gone out of scope (or have otherwise been
+dropped), it is no longer possible to send more messages via the channel. At
+this point, the `recv` call on the `Receiver` can only ever return `None`. A
+receiver's `recv` call returning `None` indicates that all senders are gone and
+the channel is closed and no longer usable.
 
 In our case of a task that manages the Redis connection, it knows that it
 can close the Redis connection once the channel is closed, as the connection
